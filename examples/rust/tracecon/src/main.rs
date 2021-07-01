@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 use core::time::Duration;
-use libbpf_rs::PerfBufferBuilder;
+use libbpf_rs::{PerfBufferBuilder};
 use object::Object;
 use object::ObjectSymbol;
 use plain::Plain;
@@ -10,6 +10,17 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use structopt::StructOpt;
+use sysinfo::{RefreshKind, System, SystemExt, ProcessExt};
+use lazy_static::lazy_static;
+use prometheus::{IntCounterVec, Registry, Opts, register_int_counter_vec};
+
+lazy_static! {
+    static ref TRACECON_COLLECTOR: IntCounterVec = register_int_counter_vec!(
+        "traced_connections",
+        "Traced Connections",
+        &["pid", "host", "ip", "name"]
+    ).unwrap();
+}
 
 #[path = "bpf/.output/tracecon.skel.rs"]
 mod tracecon;
@@ -66,11 +77,21 @@ fn handle_event(_cpu: i32, data: &[u8]) {
     let mut event = Event::default();
     plain::copy_from_bytes(&mut event, data).expect("Event data buffer was too short");
 
-    match event.tag {
-        0 => println!("ip event: {}", Ipv4Addr::from(event.ip)),
-        1 => println!("host event: {}", String::from_utf8_lossy(&event.hostname)),
-        _ => {}
-    }
+    let sys = System::new_with_specifics(RefreshKind::new().with_processes());
+    let name = sys.get_process(event.pid as i32).map(ProcessExt::name).unwrap_or("");
+
+    let (ip, host) = match event.tag {
+        // 1 => (Ipv4Addr::from(event.ip), String::from_utf8_lossy(&event.hostname)),
+        1 => (Ipv4Addr::from(event.ip), String::from("")),
+        _ => (Ipv4Addr::from(event.ip), String::from("")),
+    };
+
+    TRACECON_COLLECTOR.with_label_values(&[
+        &format!("{}", event.pid),
+        &format!("{}", host),
+        &format!("{}", ip),
+        name
+    ]).inc();
 }
 
 fn main() -> Result<()> {
@@ -112,15 +133,18 @@ fn main() -> Result<()> {
     let perf = PerfBufferBuilder::new(skel.maps_mut().events())
         .sample_cb(handle_event)
         .build()?;
-
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
+
     ctrlc::set_handler(move || {
         r.store(false, Ordering::SeqCst);
     })?;
 
+    let addr = "0.0.0.0:9184".parse()?;
+    prometheus_exporter::start(addr)?;
+
     while running.load(Ordering::SeqCst) {
-        perf.poll(Duration::from_millis(100))?;
+       perf.poll(Duration::from_millis(100))?;
     }
 
     Ok(())

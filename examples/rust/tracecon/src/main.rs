@@ -1,25 +1,25 @@
 use anyhow::{anyhow, bail, Result};
 use core::time::Duration;
-use libbpf_rs::{PerfBufferBuilder};
+use lazy_static::lazy_static;
+use libbpf_rs::PerfBufferBuilder;
 use object::Object;
 use object::ObjectSymbol;
 use plain::Plain;
+use prometheus::{register_int_counter_vec, IntCounterVec};
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use structopt::StructOpt;
-use sysinfo::{RefreshKind, System, SystemExt, ProcessExt};
-use lazy_static::lazy_static;
-use prometheus::{IntCounterVec, Registry, Opts, register_int_counter_vec};
 
 lazy_static! {
     static ref TRACECON_COLLECTOR: IntCounterVec = register_int_counter_vec!(
         "traced_connections",
         "Traced Connections",
-        &["pid", "host", "ip", "name"]
-    ).unwrap();
+        &["pid", "host", "ip"]
+    )
+    .unwrap();
 }
 
 #[path = "bpf/.output/tracecon.skel.rs"]
@@ -73,25 +73,38 @@ fn get_symbol_address(so_path: &str, fn_name: &str) -> Result<usize> {
     Ok(symbol.address() as usize)
 }
 
-fn handle_event(_cpu: i32, data: &[u8]) {
+enum ParsedEvent {
+    Ip(u32, Ipv4Addr),
+    Host(u32, String),
+}
+
+fn parse_event(data: &[u8]) -> Result<ParsedEvent> {
     let mut event = Event::default();
-    plain::copy_from_bytes(&mut event, data).expect("Event data buffer was too short");
+    plain::copy_from_bytes(&mut event, data)
+        .map_err(|_| anyhow!("could not parse event buffer"))?;
+    let utf8_hostname = std::str::from_utf8(&event.hostname)?
+        .trim_end_matches(char::from(0))
+        .to_string();
+    let ip_v4 = Ipv4Addr::from(event.ip);
 
-    let sys = System::new_with_specifics(RefreshKind::new().with_processes());
-    let name = sys.get_process(event.pid as i32).map(ProcessExt::name).unwrap_or("");
-
-    let (ip, host) = match event.tag {
-        // 1 => (Ipv4Addr::from(event.ip), String::from_utf8_lossy(&event.hostname)),
-        1 => (Ipv4Addr::from(event.ip), String::from("")),
-        _ => (Ipv4Addr::from(event.ip), String::from("")),
+    let parsed_event = match event.tag {
+        1 => ParsedEvent::Host(event.pid, utf8_hostname),
+        _ => ParsedEvent::Ip(event.pid, ip_v4),
     };
 
-    TRACECON_COLLECTOR.with_label_values(&[
-        &format!("{}", event.pid),
-        &format!("{}", host),
-        &format!("{}", ip),
-        name
-    ]).inc();
+    Ok(parsed_event)
+}
+
+fn handle_event(_cpu: i32, data: &[u8]) {
+    if let Ok(event) = parse_event(data) {
+        let (pid, host, ip) = match event {
+            ParsedEvent::Host(pid, host) => (format!("{}", pid), host, String::new()),
+            ParsedEvent::Ip(pid, ip) => (format!("{}", pid), String::new(), format!("{}", ip)),
+        };
+        TRACECON_COLLECTOR
+            .with_label_values(&[&pid, &host, &ip])
+            .inc();
+    }
 }
 
 fn main() -> Result<()> {
@@ -144,7 +157,7 @@ fn main() -> Result<()> {
     prometheus_exporter::start(addr)?;
 
     while running.load(Ordering::SeqCst) {
-       perf.poll(Duration::from_millis(100))?;
+        perf.poll(Duration::from_millis(200))?;
     }
 
     Ok(())
